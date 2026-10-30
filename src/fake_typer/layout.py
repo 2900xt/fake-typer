@@ -64,6 +64,8 @@ SPECIAL_KEYS = {
     "select_line_start": Key("KEY_HOME", True, 8, None),  # Shift+Home
     "line_end": Key("KEY_END", False, 8, None),
     "select_line_end": Key("KEY_END", True, 8, None),     # Shift+End
+    "left": Key("KEY_LEFT", False, 8, None),
+    "right": Key("KEY_RIGHT", False, 8, None),
 }
 
 # Common typographic characters that have an obvious keyboard equivalent.

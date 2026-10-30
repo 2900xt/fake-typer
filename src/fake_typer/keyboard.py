@@ -17,6 +17,8 @@ from .timing import KeyEvent
 DEVICE_NAME = "fake-typer virtual keyboard"
 ABORT_KEY = "KEY_ESC"
 PAUSE_KEY = "KEY_F9"
+DOUBLE_TAP = 0.5  # seconds: the keybind pressed twice this fast stops typing
+MODIFIERS = {f"KEY_{side}{m}" for side in ("LEFT", "RIGHT") for m in ("META", "ALT", "CTRL")}
 
 
 class VirtualKeyboard:
@@ -58,10 +60,13 @@ class TerminalKeyboard:
             return
         if not down:
             return
+        # Insert and delete rather than overwrite, for edits in the middle of a line.
         if key == "KEY_BACKSPACE":
-            sys.stdout.write("\b \b")
-        else:
-            sys.stdout.write(self.chars.get((key, bool(self.shift)), ""))
+            sys.stdout.write("\b\x1b[P")
+        elif key in ("KEY_LEFT", "KEY_RIGHT"):
+            sys.stdout.write("\x1b[D" if key == "KEY_LEFT" else "\x1b[C")
+        elif (char := self.chars.get((key, bool(self.shift)))) is not None:
+            sys.stdout.write(char if char == "\n" else "\x1b[@" + char)
         sys.stdout.flush()
 
     def close(self) -> None:
@@ -75,6 +80,8 @@ class HotkeyWatcher(threading.Thread):
         super().__init__(daemon=True)
         self.abort = threading.Event()
         self.paused = threading.Event()
+        self.last_keybind = -DOUBLE_TAP
+        self.mods_down: set[int] = set()  # physical Super/Alt/Ctrl currently held
         self.devices = []
         try:
             from evdev import InputDevice, ecodes, list_devices
@@ -88,6 +95,7 @@ class HotkeyWatcher(threading.Thread):
             self.codes = {ecodes.ecodes[ABORT_KEY]: self.abort.set,
                           ecodes.ecodes[PAUSE_KEY]: self._toggle_pause}
             self.EV_KEY = ecodes.EV_KEY
+            self.mod_codes = {ecodes.ecodes[m] for m in MODIFIERS}
         except (ImportError, OSError):
             pass
 
@@ -113,6 +121,15 @@ class HotkeyWatcher(threading.Thread):
     def _toggle_pause(self) -> None:
         (self.paused.clear if self.paused.is_set() else self.paused.set)()
 
+    def keybind(self) -> None:
+        """The toggle keybind: pause/resume, or stop when pressed twice quickly."""
+        now = time.monotonic()
+        if now - self.last_keybind < DOUBLE_TAP:
+            self.abort.set()
+        else:
+            self._toggle_pause()
+        self.last_keybind = now
+
     def run(self) -> None:
         fds = {dev.fd: dev for dev in self.devices}
         while not self.abort.is_set() and fds:
@@ -120,7 +137,11 @@ class HotkeyWatcher(threading.Thread):
             for fd in ready:
                 try:
                     for ev in fds[fd].read():
-                        if ev.type == self.EV_KEY and ev.value == 1 and ev.code in self.codes:
+                        if ev.type != self.EV_KEY:
+                            continue
+                        if ev.code in self.mod_codes:
+                            (self.mods_down.add if ev.value else self.mods_down.discard)(ev.code)
+                        elif ev.value == 1 and ev.code in self.codes:
                             self.codes[ev.code]()
                 except OSError:  # device unplugged
                     del fds[fd]
@@ -149,6 +170,12 @@ def play(events: list[KeyEvent], kb, watcher: HotkeyWatcher | None,
                     report(ev.t, paused=True)
                     start += _wait_paused(kb, watcher)
                     report(ev.t)
+                    continue
+                if watcher and watcher.mods_down:
+                    # The user is holding Super/Alt/Ctrl (probably heading for a
+                    # shortcut); our keys would combine with it, so hold off.
+                    time.sleep(0.02)
+                    start += 0.02
                     continue
                 now = time.monotonic()
                 if now - last_report >= 0.25:

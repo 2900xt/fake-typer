@@ -41,7 +41,7 @@ def simulate(events):
     """Replay raw key events the way an OS would turn them into characters.
     Like the kernel, a press of a key that is already down is ignored."""
     chars = {(k.name, k.shift): c for c, k in KEYS.items()}
-    down, out = set(), []
+    down, out, cur = set(), [], 0
     for e in events:
         if not e.down:
             down.discard(e.key)
@@ -52,9 +52,16 @@ def simulate(events):
         shift = {"KEY_LEFTSHIFT", "KEY_RIGHTSHIFT"} & down
         if not e.key.endswith("SHIFT"):
             if e.key == "KEY_BACKSPACE":
-                out and out.pop()
+                if cur:
+                    del out[cur - 1]
+                    cur -= 1
+            elif e.key == "KEY_LEFT":
+                cur = max(cur - 1, 0)
+            elif e.key == "KEY_RIGHT":
+                cur = min(cur + 1, len(out))
             elif (e.key, bool(shift)) in chars:
-                out.append(chars[(e.key, bool(shift))])
+                out.insert(cur, chars[(e.key, bool(shift))])
+                cur += 1
     return "".join(out)
 
 
@@ -261,13 +268,13 @@ def type_into(text, quirks, seed, ide=True, rate=0.1):
     return FakeEditor(ide).run(events)
 
 
-@pytest.mark.parametrize("text", [OCAML, WIDGET])
+@pytest.mark.parametrize("text", [OCAML, WIDGET, CODE])
 def test_editor_quirks_survive_a_code_editor(text):
     for seed in range(40):
         assert type_into(text, ON, seed) == text
 
 
-@pytest.mark.parametrize("text", [OCAML, WIDGET])
+@pytest.mark.parametrize("text", [OCAML, WIDGET, CODE])
 def test_editor_quirks_are_harmless_in_a_plain_text_field(text):
     for seed in range(40):
         assert type_into(text, ON, seed, ide=False) == text
@@ -278,3 +285,60 @@ def test_without_quirks_the_editor_mangles_code():
     assert out != WIDGET and out.rstrip().endswith("}")  # leftover auto-closers, as reported
     out = type_into(OCAML, EditorQuirks(), 0, rate=0)
     assert "in_channel" in out
+
+
+from fake_typer.cli import pace
+from fake_typer.planner import random_revisions
+
+ESSAY = ("Cities have always grown around water, and the reasons are mostly practical. "
+         "A river is a road, a sewer and a source of food at once.\n\n"
+         "But the same rivers flood, and modern cities have spent a great deal of money "
+         "keeping them in their banks, with mixed results.\n")
+
+
+def test_revisions_go_back_and_still_produce_target():
+    for seed in range(200):
+        rng = random.Random(seed)
+        revisions = random_revisions(ESSAY, 8, rng)
+        actions = Planner(ESSAY, TypoModel(rate=0.05), rng, revisions=revisions).plan()
+        assert replay(actions) == ESSAY
+        events = to_events(Timer(Rhythm(compose=True), rng).schedule(actions), rng)
+        assert simulate(events) == ESSAY
+    assert any(a.char == "left" for a in actions) and any(a.tag == "draft" for a in actions)
+
+
+def test_scripted_revisions_rewrite_in_place():
+    text = "The results were good and the method was simple."
+    revisions = {text.index("good"): ("fine", 4, 20), text.index("simple"): ("very simple", 6, 1)}
+    actions = Planner(text, TypoModel(rate=0), random.Random(0), revisions=revisions).plan()
+    assert replay(actions) == text
+    typed = "".join(a.char for a in actions if a.kind == "char")
+    assert "fine and the method" in typed and "very " in typed
+    lefts = [a for a in actions if a.char == "left"]
+    # 20 back to the end of "fine"; then over "." and the "simple" both versions share
+    assert len(lefts) == 20 + 7
+
+
+def test_llm_revisions_resolve():
+    raw = {"mistakes": [], "pauses": [], "revisions": [
+        {"line": 3, "original": "a great deal of money", "occurrence": 1, "typed": "lots of money",
+         "fix": "go_back", "noticed_after": 30, "kind": "reword"},
+        {"line": 1, "original": "mostly practical", "occurrence": 1, "typed": "practical",
+         "fix": "backspace", "noticed_after": 200, "kind": "add"},
+        {"line": 1, "original": "", "occurrence": 1, "typed": "really",
+         "fix": "go_back", "noticed_after": 3, "kind": "cut"},       # no anchor: dropped
+    ]}
+    plan = llm.resolve(ESSAY, raw, code=False)
+    assert [(m.typed, m.go_back, m.noticed_after) for m in plan.mistakes] == [
+        ("practical", False, 80), ("lots of money", True, 30)]
+    assert plan.dropped == 1
+
+
+def test_compose_pace_reaches_target():
+    text = ESSAY * 6
+    rng = random.Random(3)
+    actions = Planner(text, TypoModel(rate=0.03), rng,
+                      revisions=random_revisions(text, 2, rng)).plan()
+    target = len(text.split()) / 20 * 60
+    strokes = pace(actions, Rhythm(wpm=70, compose=True, max_pause=90), rng, target)
+    assert abs(strokes[-1].t - target) < 0.1 * target

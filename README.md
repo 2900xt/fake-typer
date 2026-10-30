@@ -13,12 +13,13 @@ Wayland (Hyprland, GNOME, KDE), X11, and even a TTY.
 
    ```lua
    hl.bind("SUPER + ALT + V", hl.dsp.exec_cmd(HOME .. "/.local/bin/fake-typer toggle"))
-   hl.bind("SUPER + ALT + SHIFT + V", hl.dsp.exec_cmd(HOME .. "/.local/bin/fake-typer stop"))
    ```
 
 3. Copy some text, click where it should go, and press **Super+Alt+V**. It waits
    until you let go of the keys, then types into the focused window. Press the
-   keybind again to pause or resume, and **Super+Alt+Shift+V** (or Esc) to stop.
+   keybind again to pause or resume, or tap V twice quickly (holding Super+Alt) to
+   stop. Esc also stops. While you hold Super, Alt or Ctrl it holds off typing, so
+   its keys never combine with yours into a shortcut.
 
 Settings for keybind runs go in `~/.config/fake-typer/config.toml`. It holds the
 same options as the command line, e.g. `wpm = 80`, `llm = true` or `persona = "..."`.
@@ -29,7 +30,7 @@ state (`planning`/`typing`/`paused`/`done`/`stopped`/`error`), progress, time
 left and a preview. It's rewritten at least every 2 s. `fake-typer status` prints it.
 A Quickshell bar widget for end-4's illogical-impulse config (copy in `extras/quickshell-ii/`) is in
 `~/.config/quickshell/ii/modules/ii/bar/FakeTyper.qml`. It shows a progress ring
-and "Typing 42% · 1:23 left". Click it to pause and right-click to stop.
+and "Typing 42% · 1:23 left". It's display-only; control it with the keybind.
 
 ## Usage
 
@@ -46,7 +47,32 @@ While typing: **Esc** stops, **F9** pauses/resumes.
 
 Main options: `--wpm`, `--typo-rate` (0 for none), `--think-rate`, `--max-pause`,
 `--mode auto|prose|code`, `--strip-indent`, `--delay`, `--seed`, `--llm`, `--persona`,
-`--model`. See `--help`.
+`--model`, `--compose`, `--compose-wpm`, `--revise-rate`. See `--help`.
+
+### Long documents (`--compose`)
+
+Prose of 250 words or more (an essay, say) is typed as if it were being written
+for the first time, not copied. Turn this on or off with `--compose` / `--no-compose`.
+
+- **Pace:** it types in bursts at `--wpm`, then stops to think: up to a minute
+  before a new paragraph, a few seconds before a sentence, now and then a hunt
+  for the right word. These pauses are stretched so the whole run averages
+  `--compose-wpm` (default 20) including all the thinking and revising. A
+  600-word essay takes about half an hour. A single pause is capped at
+  `--max-pause` (90 s when composing).
+- **Revising the draft:** about `--revise-rate` (default 1.5) times per 100 words,
+  the first draft differs from the final text. Sometimes the typist notices while
+  still typing, deletes back and rewrites. Otherwise they finish more of the
+  sentence, reread it, go back with the arrow keys, fix it in place, and carry on
+  from where they were. Without `--llm` this means leaving a word out and adding
+  it back, or putting a filler word ("really", "just") in and cutting it. With
+  `--llm`, Claude writes real revisions: a different word first (`shows` →
+  `suggests`), a qualifier or clause added on rereading, a redundant phrase cut,
+  and also suggests longer planning pauses where the argument turns.
+
+Revisions only go back within the current paragraph, and at most 90 characters,
+since the arrow keys are the only movement every app handles the same way.
+Compose mode can't be combined with `--editor`.
 
 ### LLM-planned mistakes (`--llm`)
 
@@ -78,7 +104,7 @@ discarded, so the output still always matches the input.
 
 ## How it works
 
-- **`planner.py`** decides where mistakes happen. The chance goes up for symbols,
+- **`planner.py`** decides where mistakes and draft revisions happen. The chance goes up for symbols,
   digits, and shifted keys, and down for the first letter of a word and just after
   a correction. The mistake types are: hitting a neighbouring key, fat-fingering two
   keys, skipping a character, swapping two (`teh`), doubling a key, and Shift slips

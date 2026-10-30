@@ -7,11 +7,11 @@ import Quickshell
 import Quickshell.Io
 
 // Progress of fake-typer (~/Code/fake-typer). Reads the status file it writes to
-// $XDG_RUNTIME_DIR/fake-typer/status.json. Left click: pause/resume. Right click: stop.
+// $XDG_RUNTIME_DIR/fake-typer/status.json. Display only: Super+Alt+V pauses/resumes,
+// double-tapping it stops.
 Item {
     id: root
 
-    readonly property string command: Quickshell.env("HOME") + "/.local/bin/fake-typer"
     property var status: ({})
     property real now: Date.now() / 1000
 
@@ -80,17 +80,13 @@ Item {
         property bool hovered: false
         onEntered: hovered = true
         onExited: hovered = false
-        acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
-        onPressed: event => {
-            if (!root.running) return;
-            Quickshell.execDetached([root.command, event.button === Qt.LeftButton ? "pause" : "stop"]);
-        }
+        acceptedButtons: Qt.NoButton
 
         PopupToolTip {
             extraVisibleCondition: (root.status.preview ?? "").length > 0
             text: `${root.status.preview ?? ""}${(root.status.chars ?? 0) > 80 ? "…" : ""}\n\n`
                 + `${root.status.chars ?? 0} characters · ${root.status.typos ?? 0} typos planned\n`
-                + "Click: pause/resume · Right-click: stop"
+                + "Super+Alt+V: pause/resume · twice quickly: stop"
         }
     }
 

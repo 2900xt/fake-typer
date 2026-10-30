@@ -12,11 +12,12 @@ from pathlib import Path
 from . import llm, status
 from .keyboard import ABORT_KEY, PAUSE_KEY, HotkeyWatcher, TerminalKeyboard, VirtualKeyboard, play
 from .layout import NORMALIZE, can_type
-from .planner import EditorQuirks, Planner, TypoModel, replay
+from .planner import EditorQuirks, Planner, TypoModel, random_revisions, replay
 from .timing import Rhythm, Timer, to_events
 
 
 CONFIG_DIR = Path("~/.config/fake-typer").expanduser()
+COMPOSE_WORDS = 250  # prose at least this long is typed as if being written
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 ENV_FILES = [".env", CONFIG_DIR / ".env"]
 
@@ -87,7 +88,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Type text into the focused window like a human would, "
                     "rhythm, typos, corrections and all.",
         epilog="commands: 'fake-typer toggle' types the clipboard, or pauses/resumes a run "
-               "in progress (meant for a keybind); 'fake-typer pause', 'fake-typer stop', "
+               "in progress, stopping it if run twice within half a second (meant for a "
+               "keybind); 'fake-typer pause', 'fake-typer stop', "
                f"'fake-typer status'. Defaults can be set in {CONFIG_FILE}.")
     ap.add_argument("file", nargs="?", help="text file to type (default: stdin)")
     ap.add_argument("-c", "--clipboard", action="store_true", help="type the clipboard contents")
@@ -105,7 +107,17 @@ def build_parser() -> argparse.ArgumentParser:
                          "auto-indented it (default: on in code mode)")
     ap.add_argument("--think-rate", type=float, default=0.02,
                     help="chance per word of a longer thinking pause (default 0.02)")
-    ap.add_argument("--max-pause", type=float, default=6.0, help="longest single pause in seconds")
+    ap.add_argument("--max-pause", type=float,
+                    help="longest single pause in seconds (default 6, or 90 when composing)")
+    ap.add_argument("--compose", action=argparse.BooleanOptionalAction, default=None,
+                    help="type as if writing the text for the first time: long stops to plan "
+                         "sentences and paragraphs, and revisions to the draft (default: on for "
+                         f"prose of {COMPOSE_WORDS}+ words)")
+    ap.add_argument("--compose-wpm", type=float, default=20,
+                    help="overall pace when composing, counting all the thinking and revising; "
+                         "--wpm still sets the speed of each burst (default 20)")
+    ap.add_argument("--revise-rate", type=float, default=1.5,
+                    help="revisions to the draft per 100 words when composing (default 1.5)")
     ap.add_argument("-d", "--delay", type=float,
                     help="seconds to wait before typing, to focus the target window "
                          "(default 5, or 0.3 with --keybind)")
@@ -168,6 +180,21 @@ def main() -> None:
     run(args)
 
 
+def pace(actions, rhythm: Rhythm, rng: random.Random, target: float | None):
+    """Time the actions; with a target duration (seconds), stretch or shrink the
+    thinking pauses until the whole run takes about that long."""
+    seed = rng.random()
+    for _ in range(5):
+        timer = Timer(rhythm, random.Random(seed))  # same seed: only the pauses change
+        strokes = timer.schedule(actions)
+        if not (target and strokes and timer.thinking) or abs(strokes[-1].t - target) < 0.03 * target:
+            break
+        # Pauses that hit max_pause don't stretch, so this converges over a few rounds.
+        busy = strokes[-1].t - timer.thinking  # typing, fixing and rereading
+        rhythm.pause_scale *= max(target - busy, 0.1 * timer.thinking) / timer.thinking
+    return strokes
+
+
 def run(args) -> None:
     def notify(title: str, body: str = "") -> None:
         if args.keybind:
@@ -191,7 +218,7 @@ def run(args) -> None:
             raise KeyboardInterrupt  # still planning: bail out right away
 
     signal.signal(signal.SIGTERM, on_stop)
-    signal.signal(signal.SIGUSR1, lambda *_: watcher and watcher._toggle_pause())
+    signal.signal(signal.SIGUSR1, lambda *_: watcher and watcher.keybind())
 
     try:
         st.update(state="planning", progress=0.0, remaining=0.0, message="Reading text")
@@ -204,6 +231,12 @@ def run(args) -> None:
             text = re.sub(r"[ \t]+$", "", text, flags=re.M)  # trailing blanks can't be kept
         if not text:
             raise Failure("Nothing to type")
+        words = len(text.split())
+        compose = (not code and words >= COMPOSE_WORDS) if args.compose is None else args.compose
+        if compose and editor:
+            raise Failure("--compose goes back with the arrow keys, which needs --no-editor")
+        max_pause = args.max_pause if args.max_pause is not None else (90.0 if compose else 6.0)
+        n_revisions = round(words / 100 * args.revise_rate) if compose else 0
         st.update(preview=text[:80], chars=len(text), mode="code" if code else "prose")
 
         # Create the device early so the compositor has picked it up by the time we type.
@@ -212,14 +245,18 @@ def run(args) -> None:
 
         rng = random.Random(args.seed)
         model, scripted, pauses = TypoModel(rate=args.typo_rate, code=code), {}, {}
-        if args.llm and args.typo_rate > 0:
+        revisions = random_revisions(text, args.revise_rate, rng) if compose else {}
+        if args.llm and (args.typo_rate > 0 or n_revisions):
             print(f"Asking {args.model} where this typist would slip up...", file=sys.stderr)
             st.update(message="Asking Claude where to make mistakes")
-            n = max(1, round(len(text) * args.typo_rate))
-            plan = llm.plan(text, code, n, args.persona, args.model, warn=warn)
+            n = round(len(text) * args.typo_rate)
+            plan = llm.plan(text, code, n, args.persona, args.model, warn=warn, n_revisions=n_revisions)
             if plan:
-                model.rate = 0  # Claude's mistakes replace the random ones
-                scripted = {m.pos: (m.typed, len(m.original), m.noticed_after) for m in plan.mistakes}
+                model.rate = 0  # Claude's mistakes and revisions replace the random ones
+                scripted = {m.pos: (m.typed, len(m.original), m.noticed_after)
+                            for m in plan.mistakes if not m.go_back}
+                revisions = {m.pos: (m.typed, len(m.original), m.noticed_after)
+                             for m in plan.mistakes if m.go_back}
                 pauses = plan.pauses
                 kinds = {}
                 for m in plan.mistakes:
@@ -230,16 +267,19 @@ def run(args) -> None:
                       file=sys.stderr)
         quirks = EditorQuirks(dismiss_completion=editor, clear_auto_pairs=editor,
                               fix_indentation=editor and not args.strip_indent)
-        actions = Planner(text, model, rng, scripted, pauses, quirks).plan()
+        actions = Planner(text, model, rng, scripted, pauses, quirks, revisions).plan()
         assert replay(actions) == text, "planner produced the wrong text"
-        rhythm = Rhythm(wpm=args.wpm, code=code, max_pause=args.max_pause, think_rate=args.think_rate)
-        strokes = Timer(rhythm, rng).schedule(actions)
+        rhythm = Rhythm(wpm=args.wpm, code=code, max_pause=max_pause, think_rate=args.think_rate,
+                        compose=compose)
+        strokes = pace(actions, rhythm, rng, words / args.compose_wpm * 60 if compose else None)
         events = to_events(strokes, rng)
 
         typos = sum(1 for a in actions if a.kind == "notice")
+        revised = sum(1 for a in actions if a.kind == "pause" and a.tag == "revise")
         duration = events[-1].t if events else 0
-        print(f"{len(text)} characters, {'code' if code else 'prose'} mode, {typos} typos, "
-              f"about {duration / 60:.1f} min", file=sys.stderr)
+        print(f"{len(text)} characters, {'composing' if compose else ('code' if code else 'prose')} "
+              f"mode, {typos} typos" + (f", {revised} later revisions" if compose else "") +
+              f", about {duration / 60:.1f} min", file=sys.stderr)
         if not editor and not args.strip_indent and re.search(r"(?m)^[ \t]", text):
             print("hint: if the target editor auto-indents, use --editor or --strip-indent",
                   file=sys.stderr)

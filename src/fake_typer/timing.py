@@ -22,6 +22,10 @@ class Rhythm:
     code: bool = False
     max_pause: float = 6.0        # cap on any single thinking pause, seconds
     think_rate: float = 0.02      # chance per word of a longer "what next?" pause
+    # Composing (an essay, say) rather than copying: much longer stops to plan
+    # sentences and paragraphs, and hesitations mid-sentence.
+    compose: bool = False
+    pause_scale: float = 1.0      # multiplies every thinking pause (to reach a target pace)
 
 
 @dataclass
@@ -45,6 +49,7 @@ class Timer:
         self.rng = rng
         self.base = 60.0 / (rhythm.wpm * 5)   # mean seconds per keystroke
         self.flow = 1.0                         # slowly drifting speed (bursts and lulls)
+        self.thinking = 0.0                     # total seconds spent in thinking pauses
 
     def _ln(self, mean: float, sigma: float) -> float:
         """Lognormal sample with the given mean."""
@@ -52,6 +57,12 @@ class Timer:
 
     def _pause(self, mean: float, sigma: float = 0.5) -> float:
         return min(self._ln(mean, sigma), self.r.max_pause)
+
+    def _think(self, mean: float, sigma: float = 0.5) -> float:
+        """A pause spent thinking about the content, which `pause_scale` stretches."""
+        t = min(self._ln(mean, sigma) * self.r.pause_scale, self.r.max_pause)
+        self.thinking += t
+        return t
 
     def _drift(self) -> None:
         # AR(1) process around 1.0: typists speed up and slow down in stretches.
@@ -98,14 +109,23 @@ class Timer:
             mean *= 1.5 if not self.r.code else 1.25
 
         extra = 0.0
-        if p == "\n":
+        if self.r.compose:
+            if p == "\n" and ch != "\n":
+                extra += self._think(25.0 if pp == "\n" else 6.0, 0.8)  # planning a paragraph
+            elif p == " " and pp in ".!?":
+                extra += self._think(3.5, 0.8)     # the next sentence
+            elif p == " " and pp in ",;:":
+                extra += self._think(1.0, 0.7)
+            if p == " " and ch != " " and self.rng.random() < self.r.think_rate * 3:
+                extra += self._think(4.0, 0.9)     # searching for the right word
+        elif p == "\n":
             extra += self._pause(1.6 if pp == "\n" else (0.9 if self.r.code else 0.6))
         elif p == " " and pp in ".!?":
             extra += self._pause(0.7)          # new sentence
         elif p == " " and pp in ",;:":
             extra += self._pause(0.25)
         if p in " \n" and ch not in " \n" and self.rng.random() < self.r.think_rate:
-            extra += self._pause(2.0, 0.6)    # occasional stop to think
+            extra += self._think(2.0, 0.6)    # occasional stop to think
         if p == " " and ch != " ":
             mean *= 1.15                       # starting a new word
 
@@ -117,15 +137,29 @@ class Timer:
     def schedule(self, actions: list[Action]) -> list[Stroke]:
         strokes, t = [], 0.0
         prev = prev2 = None
+        last_key = None  # the previous action, if it was an editing key
         for a in actions:
             if a.kind == "pause":
-                t += min(a.duration, self.r.max_pause)
+                if a.tag == "revise":
+                    t += min(a.duration, self.r.max_pause)  # rereading, not composing
+                else:
+                    t += min(a.duration * self.r.pause_scale, self.r.max_pause)
+                    self.thinking += min(a.duration * self.r.pause_scale, self.r.max_pause)
                 continue
             if a.kind == "key":
                 # Editing keys (Esc, Shift+Home) don't change the typing context.
-                t += self._ln(self.base * 0.8, 0.2)
+                if a.char in ("left", "right"):
+                    # Tapping an arrow key in a run, after moving a hand over to it.
+                    same = last_key and last_key.char == a.char
+                    t += self._ln(0.07, 0.25) if same else self._ln(0.35, 0.3)
+                else:
+                    t += self._ln(self.base * 0.8, 0.2)
                 strokes.append(Stroke(t, SPECIAL_KEYS[a.char], self.dwell(), a))
+                last_key = a
                 continue
+            if last_key and last_key.char in ("left", "right"):
+                t += self._ln(0.3, 0.3)  # hand back from the arrow keys
+            last_key = None
             t += self.gap(prev, prev2, a)
             if a.kind != "notice":
                 key = BACKSPACE if a.kind == "backspace" else KEYS[a.char]
